@@ -3,6 +3,17 @@
 
 #[cfg(not(target_os = "macos"))]
 extern "C" {
+    fn ARGBScale(
+        src_argb: *const u8,
+        src_stride: i32,
+        src_width: i32,
+        src_height: i32,
+        dst_argb: *mut u8,
+        dst_stride: i32,
+        dst_width: i32,
+        dst_height: i32,
+        filter: i32,
+    ) -> i32;
     fn ARGBToI420(
         src_argb: *const u8,
         src_stride_argb: i32,
@@ -15,6 +26,59 @@ extern "C" {
         width: i32,
         height: i32,
     ) -> i32;
+}
+
+/// Packed BGRA (or RGBA) scaling; channel order is preserved. Box filtering
+/// keeps desktop text legible when a wide display is bounded for a phone.
+#[cfg(not(target_os = "macos"))]
+pub fn scale_argb(
+    src: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst: &mut [u8],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    if src_width == 0
+        || src_height == 0
+        || width == 0
+        || height == 0
+        || src.len() < src_width * src_height * 4
+        || dst.len() < width * height * 4
+    {
+        return Err("invalid packed frame geometry".into());
+    }
+    let result = unsafe {
+        ARGBScale(
+            src.as_ptr(),
+            (src_width * 4) as i32,
+            src_width as i32,
+            src_height as i32,
+            dst.as_mut_ptr(),
+            (width * 4) as i32,
+            width as i32,
+            height as i32,
+            3,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err("libyuv could not scale the desktop frame".into())
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod scale_tests {
+    use super::*;
+    #[test]
+    fn bounded_argb_preserves_uniform_pixels_and_rejects_short_frames() {
+        let input = [12, 34, 56, 255].repeat(8 * 4);
+        let mut output = vec![0; 4 * 2 * 4];
+        scale_argb(&input, 8, 4, &mut output, 4, 2).unwrap();
+        assert!(output.chunks_exact(4).all(|p| p == [12, 34, 56, 255]));
+        assert!(scale_argb(&input[..8], 8, 4, &mut output, 4, 2).is_err());
+    }
 }
 
 pub struct I420 {

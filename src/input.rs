@@ -39,6 +39,7 @@ pub enum InputEvent {
     ReleaseAll,
     /// Undo keymap changes before exit.
     Shutdown,
+    ShutdownAck(mpsc::Sender<()>),
 }
 
 enum ShiftFix {
@@ -480,6 +481,11 @@ impl Injector {
                         self.fake(xproto::BUTTON_RELEASE_EVENT, b as u8, 0, 0);
                     }
                 }
+            }
+            InputEvent::ShutdownAck(done) => {
+                self.handle(InputEvent::Shutdown);
+                let _ = self.conn.flush();
+                let _ = done.send(());
             }
         }
     }

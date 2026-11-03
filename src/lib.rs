@@ -26,6 +26,7 @@ mod mac;
 mod mic;
 mod mp4;
 mod record;
+mod rtc;
 #[cfg(target_os = "linux")]
 mod screen;
 mod server;
@@ -337,6 +338,8 @@ async fn serve(a: HashMap<String, String>) {
             std::process::exit(1);
         });
     let state = server::AppState {
+        stopping: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rtc: rtc::Peers::new(),
         hub: hub.clone(),
         audio: audio_on,
         epoch: Instant::now(),

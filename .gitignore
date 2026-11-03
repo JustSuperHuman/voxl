@@ -3,3 +3,5 @@ bench/loadgen
 bench/rootlat
 result
 node_modules
+/dist
+/source-bundle

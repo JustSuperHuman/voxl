@@ -1,11 +1,11 @@
 [package]
 # `voxl` on crates.io belongs to an unrelated crate; the binary is still `voxl`.
 name = "voxl-server"
-version = "0.3.2"
+version = "0.3.2-bro.1"
 edition = "2021"
 license = "MIT"
 description = "Low-latency desktop streaming for the browser: an X11 display or a Mac's screen as H.264 over a WebSocket"
-repository = "https://github.com/tembo/voxl"
+repository = "https://github.com/JustSuperHuman/voxl"
 readme = "README.md"
 # Lets programs that embed voxl read DEP_VOXL_RPATH (see build.rs).
 links = "voxl"
@@ -43,6 +43,7 @@ tokio = { version = "1", features = [
 	"io-util",
 ] }
 axum = { version = "0.8", features = ["ws"] }
+webrtc = "=0.14.0"
 libc = "0.2"
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
@@ -112,9 +113,13 @@ windows = { version = "0.61", features = [
 windows-core = "0.61"
 
 [build-dependencies]
-bindgen = "0.71"
+bindgen = "=0.72.1"
 pkg-config = "0.3"
 vcpkg = "0.2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = "0.29"
 
 [profile.release]
 opt-level = 3

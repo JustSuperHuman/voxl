@@ -41,13 +41,92 @@ pub struct Geometry {
 
 /// Set by the capturer whenever it (re)starts; read by input to map coordinates.
 pub static GEOMETRY: Mutex<Option<Geometry>> = Mutex::new(None);
+/// Stream pixels, independent of the physical display mode.
+pub static STREAM_SIZE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 struct Settings {
     /// Index into `outputs()` (0 is the primary display).
     display: usize,
+    max_width: u32,
+    max_height: u32,
+    max_pixels: u64,
 }
 
-static SETTINGS: Mutex<Settings> = Mutex::new(Settings { display: 0 });
+static SETTINGS: Mutex<Settings> = Mutex::new(Settings {
+    display: 0,
+    max_width: 2560,
+    max_height: 1440,
+    max_pixels: 3_686_400,
+});
+
+pub fn stream_size(width: u32, height: u32) -> (u32, u32) {
+    let s = SETTINGS.lock();
+    fit_stream(width, height, s.max_width, s.max_height, s.max_pixels)
+}
+
+fn fit_stream(
+    width: u32,
+    height: u32,
+    max_width: u32,
+    max_height: u32,
+    max_pixels: u64,
+) -> (u32, u32) {
+    let mut scale = 1.0f64;
+    if max_width > 0 {
+        scale = scale.min(max_width as f64 / width.max(1) as f64);
+    }
+    if max_height > 0 {
+        scale = scale.min(max_height as f64 / height.max(1) as f64);
+    }
+    if max_pixels > 0 {
+        scale =
+            scale.min((max_pixels as f64 / (width.max(1) as f64 * height.max(1) as f64)).sqrt());
+    }
+    (
+        ((width as f64 * scale).floor() as u32 & !1).max(2),
+        ((height as f64 * scale).floor() as u32 & !1).max(2),
+    )
+}
+
+/// Pixel endpoints map exactly, including monitors left of/above the primary.
+pub fn stream_to_desktop(g: Geometry, stream: (u32, u32), x: i32, y: i32) -> (i32, i32) {
+    let map = |p: i32, from: u32, to: u32| {
+        p.clamp(0, from.saturating_sub(1) as i32) as i64 * to.saturating_sub(1) as i64
+            / from.saturating_sub(1).max(1) as i64
+    };
+    (
+        g.left + map(x, stream.0, g.width) as i32,
+        g.top + map(y, stream.1, g.height) as i32,
+    )
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    #[test]
+    fn ultrawide_and_portrait_fit_mobile_decoder_bounds() {
+        assert_eq!(fit_stream(5120, 1440, 2560, 1440, 3_686_400), (2560, 720));
+        assert_eq!(fit_stream(1920, 1080, 2560, 1440, 3_686_400), (1920, 1080));
+        assert_eq!(fit_stream(2160, 3840, 2560, 1440, 3_686_400), (810, 1440));
+        let (w, h) = fit_stream(7680, 4320, 0, 0, 3_000_000);
+        assert!(w as u64 * h as u64 <= 3_000_000 && w % 2 == 0 && h % 2 == 0);
+    }
+    #[test]
+    fn stream_pointer_maps_all_monitor_edges_and_clamps() {
+        let g = Geometry {
+            left: -5120,
+            top: -1440,
+            width: 5120,
+            height: 1440,
+        };
+        assert_eq!(stream_to_desktop(g, (2560, 720), 0, 0), (-5120, -1440));
+        assert_eq!(stream_to_desktop(g, (2560, 720), 2559, 719), (-1, -1));
+        assert_eq!(stream_to_desktop(g, (2560, 720), -100, -1), (-5120, -1440));
+        assert_eq!(stream_to_desktop(g, (2560, 720), 9999, 9999), (-1, -1));
+        let middle = stream_to_desktop(g, (2560, 720), 1280, 360);
+        assert!((middle.0 + 2560).abs() <= 3 && (middle.1 + 720).abs() <= 3);
+    }
+}
 
 /// One display attached to the desktop.
 pub struct Output {
@@ -127,6 +206,24 @@ pub fn init(a: &HashMap<String, String>) {
         );
     }
     let mut s = SETTINGS.lock();
+    if let Some(n) = a
+        .get("max-capture-width")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        s.max_width = n.min(16384);
+    }
+    if let Some(n) = a
+        .get("max-capture-height")
+        .and_then(|n| n.parse::<u32>().ok())
+    {
+        s.max_height = n.min(16384);
+    }
+    if let Some(n) = a
+        .get("max-capture-pixels")
+        .and_then(|n| n.parse::<u64>().ok())
+    {
+        s.max_pixels = n.min(268_435_456);
+    }
     // --display: an index (0 is the primary display); ":1" style values work too.
     if let Some(n) = a
         .get("display")

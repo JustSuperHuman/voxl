@@ -3,7 +3,7 @@
 use crate::hub::{Client, Hub, Out};
 use crate::input::InputEvent;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
+    pub rtc: Arc<crate::rtc::Peers>,
     pub hub: Arc<Hub>,
     pub audio: bool,
     pub epoch: Instant,
@@ -159,11 +161,77 @@ pub fn router(state: AppState) -> Router {
         .route("/inter.woff2", asset!("inter.woff2", "font/woff2"))
         .route("/healthz", get(|| async { "ok" }))
         .route("/stats", get(stats))
+        .route("/displays", get(displays))
+        .route("/shutdown", axum::routing::post(shutdown))
         .route("/ws", get(ws_handler))
+        .route("/rtc/offer", axum::routing::post(crate::rtc::offer))
+        .route("/rtc", get(crate::rtc::list))
+        .route("/rtc/{id}", axum::routing::delete(crate::rtc::remove))
         .with_state(state)
         .merge(file_routes)
         .merge(record_routes)
         .merge(wait_routes)
+}
+
+async fn displays(State(s): State<AppState>) -> axum::Json<serde_json::Value> {
+    #[cfg(windows)]
+    {
+        let displays = tokio::task::spawn_blocking(|| {
+            crate::win::outputs().iter().enumerate().map(|(index,output)| {
+                let rect=output.rect();
+                let name=crate::win::from_wide(&output.desc.DeviceName);
+                serde_json::json!({"index":index,"name":name,"width":rect.right-rect.left,"height":rect.bottom-rect.top,"primary":rect.left==0&&rect.top==0})
+            }).collect::<Vec<_>>()
+        }).await.unwrap_or_default();
+        let _ = s;
+        axum::Json(serde_json::json!(displays))
+    }
+    #[cfg(not(windows))]
+    axum::Json(
+        serde_json::json!([{"index":0,"name":"Current display","width":s.hub.width.load(Ordering::Relaxed),"height":s.hub.height.load(Ordering::Relaxed),"primary":true}]),
+    )
+}
+
+/// Remove the published sender under its mutex: in-flight producers finish
+/// before ShutdownAck, and no producer can enqueue a later key-down.
+fn prepare_shutdown(s: &AppState) -> Option<std::sync::mpsc::Receiver<()>> {
+    if s.stopping.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let input = s.hub.input.lock().take();
+    let (done, finished) = std::sync::mpsc::channel();
+    if let Some(input) = input {
+        let _ = input.send(InputEvent::ShutdownAck(done));
+    } else {
+        let _ = done.send(());
+    }
+    Some(finished)
+}
+
+async fn shutdown(State(s): State<AppState>) -> axum::Json<serde_json::Value> {
+    if let Some(finished) = prepare_shutdown(&s) {
+        s.hub.broadcast(|| Out::Text("{\"t\":\"close\"}".into()));
+        let rtc = s.rtc.clone();
+        tokio::spawn(async move {
+            rtc.close_all().await;
+        });
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let released = tokio::task::spawn_blocking(move || {
+                finished.recv_timeout(Duration::from_secs(1)).is_ok()
+            })
+            .await
+            .unwrap_or(false);
+            if !released {
+                log::error!("native input did not acknowledge shutdown before its deadline");
+            }
+            if let Some(wait) = Duration::from_millis(150).checked_sub(started.elapsed()) {
+                tokio::time::sleep(wait).await;
+            }
+            std::process::exit(0);
+        });
+    }
+    axum::Json(serde_json::json!({"ok":true}))
 }
 
 async fn stats(State(s): State<AppState>) -> Response {
@@ -203,7 +271,22 @@ async fn stats(State(s): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response {
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WsOptions {
+    #[serde(default)]
+    read_only: bool,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(mut s): State<AppState>,
+    Query(options): Query<WsOptions>,
+) -> Response {
+    if s.stopping.load(Ordering::Acquire) {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    s.read_only |= options.read_only;
     ws.max_message_size(64 << 20)
         .on_upgrade(move |socket| handle_socket(socket, s))
 }
@@ -211,10 +294,15 @@ async fn ws_handler(ws: WebSocketUpgrade, State(s): State<AppState>) -> Response
 async fn handle_socket(socket: WebSocket, s: AppState) {
     use futures_util::{SinkExt, StreamExt};
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
-    let client = s.hub.add_client(tx);
+    let (tx, mut rx) = mpsc::channel::<Out>(32);
+    let client = s.hub.add_bounded_client(tx);
     log::info!("client {} connected", client.id);
-    client.send(Out::Text(s.hub.hello()));
+    let mut hello: serde_json::Value = serde_json::from_str(&s.hub.hello()).unwrap_or_default();
+    hello["readOnly"] = s.read_only.into();
+    client.send(Out::Text(hello.to_string()));
+    if let Some(position) = s.hub.pointer.lock().clone() {
+        client.send(Out::Text(position));
+    }
     if let Some(c) = s.hub.cursor.lock().clone() {
         client.send(Out::Bin(c));
     }
@@ -225,7 +313,19 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             let big = matches!(&m, Out::Bin(b) if b.len() > 2000);
             let msg = match m {
                 Out::Bin(b) => Message::Binary(b),
-                Out::Text(t) => Message::Text(t.into()),
+                Out::Text(t) => {
+                    let t = if t.contains("\"t\":\"hello\"") {
+                        if let Ok(mut hello) = serde_json::from_str::<serde_json::Value>(&t) {
+                            hello["readOnly"] = s.read_only.into();
+                            hello.to_string()
+                        } else {
+                            t
+                        }
+                    } else {
+                        t
+                    };
+                    Message::Text(t.into())
+                }
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -258,6 +358,7 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
             // Every binary message from a viewer acts on the desktop (clipboard images,
             // microphone audio), so a read-only viewer's are all dropped.
             Message::Binary(_) if s.read_only => {}
+            Message::Binary(_) if s.stopping.load(Ordering::Acquire) => {}
             // 0x11: clipboard image (PNG) pasted on the client.
             Message::Binary(b) if b.first() == Some(&0x11) && b.len() > 1 => {
                 if let Some(tx) = s.hub.input.lock().as_ref() {
@@ -283,8 +384,10 @@ async fn handle_socket(socket: WebSocket, s: AppState) {
     }
     pinger.abort();
     writer.abort();
-    if let Some(tx) = s.hub.input.lock().as_ref() {
-        let _ = tx.send(InputEvent::ReleaseAll);
+    if !s.read_only {
+        if let Some(tx) = s.hub.input.lock().as_ref() {
+            let _ = tx.send(InputEvent::ReleaseAll);
+        }
     }
     if let Some(tx) = &s.mic {
         let _ = tx.send(crate::mic::MicMsg::Stop(client.id));
@@ -302,7 +405,15 @@ fn num<T: std::str::FromStr>(it: &mut std::str::Split<'_, char>) -> Option<T> {
 /// microphone, resizing) and is dropped. The web client keeps the same list.
 const READ_ONLY_COMMANDS: &[&str] = &["a", "v", "au", "kf", "po"];
 
-fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collections::VecDeque<u32>) {
+pub(crate) fn handle_text(
+    s: &AppState,
+    c: &Arc<Client>,
+    t: &str,
+    rtts: &mut std::collections::VecDeque<u32>,
+) {
+    if s.stopping.load(Ordering::Acquire) {
+        return;
+    }
     let (cmd, rest) = t.split_once(',').unwrap_or((t, ""));
     // --read-only: accept only what watching needs, right where commands are applied,
     // so a client that ignores the hello flag cannot drive the desktop, whatever
@@ -451,6 +562,8 @@ mod tests {
         *hub.input.lock() = Some(input_tx);
         let (mic_tx, mic_rx) = std::sync::mpsc::channel();
         let s = AppState {
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            rtc: crate::rtc::Peers::new(),
             hub: hub.clone(),
             audio: true,
             epoch: Instant::now(),

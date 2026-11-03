@@ -480,10 +480,12 @@ fn cursor_loop(hub: Arc<Hub>) {
     super::follow_input_desktop();
     let mut last: Option<(isize, bool)> = None;
     let mut serial = 0u32;
+    let mut last_pos = None;
     loop {
         std::thread::sleep(Duration::from_millis(16));
         if hub.clients.lock().is_empty() {
             last = None;
+            last_pos = None;
             continue;
         }
         let mut ci = CURSORINFO {
@@ -494,13 +496,37 @@ fn cursor_loop(hub: Arc<Hub>) {
             continue;
         }
         let shown = ci.flags.0 & CURSOR_SHOWING.0 != 0 && !ci.hCursor.is_invalid();
+        if let Some(geometry) = *super::GEOMETRY.lock() {
+            let x = ci.ptScreenPos.x - geometry.left;
+            let y = ci.ptScreenPos.y - geometry.top;
+            let stream = super::STREAM_SIZE
+                .lock()
+                .unwrap_or((geometry.width, geometry.height));
+            let pos = (x, y, shown, stream);
+            if last_pos != Some(pos) {
+                last_pos = Some(pos);
+                let visible = shown
+                    && x >= 0
+                    && y >= 0
+                    && x < geometry.width as i32
+                    && y < geometry.height as i32;
+                let x = x as i64 * stream.0.saturating_sub(1) as i64
+                    / geometry.width.saturating_sub(1).max(1) as i64;
+                let y = y as i64 * stream.1.saturating_sub(1) as i64
+                    / geometry.height.saturating_sub(1).max(1) as i64;
+                let message =
+                    serde_json::json!({"t":"pointer","x":x,"y":y,"visible":visible}).to_string();
+                *hub.pointer.lock() = Some(message.clone());
+                hub.broadcast(|| Out::Text(message.clone()));
+            }
+        }
         let key = (ci.hCursor.0 as isize, shown);
         if last == Some(key) {
             continue;
         }
         last = Some(key);
         // A hidden cursor is a transparent pixel.
-        let (w, h, hx, hy, rgba) = if shown {
+        let (mut w, mut h, mut hx, mut hy, mut rgba) = if shown {
             match cursor_image(HICON(ci.hCursor.0)) {
                 Some(c) => c,
                 None => continue,
@@ -508,6 +534,19 @@ fn cursor_loop(hub: Arc<Hub>) {
         } else {
             (1, 1, 0, 0, vec![0; 4])
         };
+        if let Some(g) = *super::GEOMETRY.lock() {
+            let stream = super::STREAM_SIZE.lock().unwrap_or((g.width, g.height));
+            let dw = (w as u64 * stream.0 as u64 / g.width.max(1) as u64).max(1) as usize;
+            let dh = (h as u64 * stream.1 as u64 / g.height.max(1) as u64).max(1) as usize;
+            if (dw, dh) != (w, h) {
+                let mut image = vec![0; dw * dh * 4];
+                if crate::convert::scale_argb(&rgba, w, h, &mut image, dw, dh).is_ok() {
+                    hx = (hx as u64 * dw as u64 / w as u64) as u32;
+                    hy = (hy as u64 * dh as u64 / h as u64) as u32;
+                    (w, h, rgba) = (dw, dh, image);
+                }
+            }
+        }
         serial = serial.wrapping_add(1);
         let mut msg = Vec::with_capacity(14 + rgba.len());
         msg.push(0x03);

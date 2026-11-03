@@ -1,0 +1,25 @@
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const version = process.argv[2] ?? '0.1.0';
+const out = process.argv[3] ?? 'dist';
+const repo = process.argv[4] ?? 'JustSuperHuman/voxl';
+if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version)) throw new Error('Invalid version.');
+if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('Invalid repository.');
+const pem = process.env.BRO_RMM_SIGNING_KEY ?? readFileSync(join(process.env.USERPROFILE ?? process.env.HOME, '.bro', 'rmm-release-signing.pem'), 'utf8');
+const key = createPrivateKey(pem);
+if (key.asymmetricKeyType !== 'ed25519') throw new Error('An Ed25519 signing key is required.');
+const manifest = JSON.parse(readFileSync(join(out, `bro-rmm-${version}-windows-x86_64`, 'manifest.json'), 'utf8').replace(/^\uFEFF/, ''));
+if (manifest.id !== 'bro-rmm' || manifest.version !== version || manifest.protocolVersion !== 1 || manifest.platform !== 'windows-x86_64' || manifest.executable !== 'voxl.exe' || !/^[a-f0-9]{64}$/.test(manifest.sha256)) throw new Error('Invalid package manifest.');
+const packageSha256 = createHash('sha256').update(readFileSync(join(out, 'bro-rmm-windows-x86_64.zip'))).digest('hex');
+const exeSha256 = createHash('sha256').update(readFileSync(join(out, `bro-rmm-${version}-windows-x86_64`, 'voxl.exe'))).digest('hex');
+if (exeSha256 !== manifest.sha256) throw new Error('The executable no longer matches its manifest.');
+const payload = Buffer.from(JSON.stringify({schemaVersion:1,id:'bro-rmm',version,protocolVersion:1,platform:'windows-x86_64',executable:'voxl.exe',sha256:manifest.sha256,packageUrl:`https://github.com/${repo}/releases/download/bro-rmm-v${version}/bro-rmm-windows-x86_64.zip`,packageSha256}), 'utf8');
+const signature = sign(null, payload, key);
+const publicKey = createPublicKey(key);
+if (!verify(null,payload,publicKey,signature)) throw new Error('Catalog self-verification failed.');
+const envelope = JSON.stringify({payload:payload.toString('base64'),signature:signature.toString('base64')})+'\n';
+if (Buffer.byteLength(envelope) > 32*1024) throw new Error('Catalog exceeds the protocol size limit.');
+writeFileSync(join(out,'catalog.json'),envelope);
+console.log(`Signed Bro RMM ${version} catalog; public key ${publicKey.export({type:'spki',format:'der'}).subarray(-32).toString('hex')}`);

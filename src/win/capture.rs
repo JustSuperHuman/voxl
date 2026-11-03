@@ -352,15 +352,17 @@ impl Capturer {
             height,
         };
         *super::GEOMETRY.lock() = Some(geometry);
-        // x264 wants even sizes; the odd last row or column is left out.
-        let (width, height) = (width & !1, height & !1);
+        // Bound the encoded stream for mobile hardware decoders without changing
+        // Windows' physical resolution. All client coordinates use this size.
+        let (width, height) = super::stream_size(width, height);
+        *super::STREAM_SIZE.lock() = Some((width, height));
         let mut me = Capturer {
             width,
             height,
             geometry,
             shared,
             wake,
-            frame: vec![0; geometry.width as usize * geometry.height as usize * 4],
+            frame: vec![0; width as usize * height as usize * 4],
             damaged: true,
             damaged_at: None,
             acc: None,
@@ -422,6 +424,20 @@ impl Capturer {
     /// Record changed areas: rows and blocks for the encoder, `changes` for /wait.
     fn add_damage(&mut self, rects: Vec<(u32, u32, u32, u32)>) {
         for (x0, y0, x1, y1) in rects {
+            // Include a filter pixel around damage before scaling its bounds.
+            let sx = self.width as f64 / self.geometry.width.max(1) as f64;
+            let sy = self.height as f64 / self.geometry.height.max(1) as f64;
+            let (x0, y0, x1, y1) =
+                if (self.width, self.height) != (self.geometry.width, self.geometry.height) {
+                    (
+                        ((x0 as f64 * sx).floor() as u32).saturating_sub(1),
+                        ((y0 as f64 * sy).floor() as u32).saturating_sub(1),
+                        (x1 as f64 * sx).ceil() as u32 + 1,
+                        (y1 as f64 * sy).ceil() as u32 + 1,
+                    )
+                } else {
+                    (x0, y0, x1, y1)
+                };
             let (x1, y1) = (x1.min(self.width), y1.min(self.height));
             if x1 <= x0 || y1 <= y0 {
                 continue;
@@ -469,7 +485,18 @@ impl Capturer {
 
     /// Copy rows [y0, y1) of the newest desktop image into the frame conversions read.
     pub fn grab(&mut self, band: Band) -> Result<(), String> {
-        let row = self.geometry.width as usize * 4;
+        if (self.width, self.height) != (self.geometry.width, self.geometry.height) {
+            let s = self.shared.lock();
+            return crate::convert::scale_argb(
+                &s.buf,
+                self.geometry.width as usize,
+                self.geometry.height as usize,
+                &mut self.frame,
+                self.width as usize,
+                self.height as usize,
+            );
+        }
+        let row = self.width as usize * 4;
         let (a, b) = (band.y0 as usize * row, band.y1 as usize * row);
         let s = self.shared.lock();
         if s.buf.len() >= b && self.frame.len() >= b {
@@ -480,7 +507,7 @@ impl Capturer {
 
     /// Convert rows [y0, y1) of the current frame into `dst`.
     pub fn convert(&self, dst: &mut crate::convert::I420, y0: usize, y1: usize, threads: usize) {
-        let stride = self.geometry.width as usize * 4;
+        let stride = self.width as usize * 4;
         crate::convert::convert_band(
             &self.frame,
             stride,
@@ -498,23 +525,16 @@ impl Capturer {
         // these pixels.
         let rects = {
             let mut s = self.shared.lock();
-            let n = s.buf.len().min(self.frame.len());
-            self.frame[..n].copy_from_slice(&s.buf[..n]);
             std::mem::take(&mut s.rects)
         };
         self.add_damage(rects);
-        let (row, h) = (self.width as usize * 4, self.height as usize);
-        let stride = self.geometry.width as usize * 4;
-        let mut out = Vec::with_capacity(row * h);
-        for line in self.frame.chunks_exact(stride).take(h) {
-            out.extend_from_slice(&line[..row]);
-        }
-        Ok(out)
+        self.grab(self.full())?;
+        Ok(self.frame.clone())
     }
 
     /// The current frame as BGRX (BGRA, alpha unused) and its stride.
     pub fn bgrx(&self) -> Option<(&[u8], usize)> {
-        Some((&self.frame, self.geometry.width as usize * 4))
+        Some((&self.frame, self.width as usize * 4))
     }
 
     /// The display changed or duplication ended: capture must be set up again.

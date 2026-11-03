@@ -22,11 +22,14 @@ pub struct Inflight {
 pub struct Client {
     pub id: u64,
     pub tx: mpsc::UnboundedSender<Out>,
+    bounded_tx: Option<mpsc::Sender<Out>>,
     pub video: AtomicBool,
     pub audio: AtomicBool,
     pub inflight: Mutex<VecDeque<Inflight>>,
     /// Smoothed min RTT (ms), from pings.
     pub min_rtt_ms: AtomicU32,
+    /// WebRTC RTCP receiver-report fraction lost (0..255).
+    pub loss_fraction: AtomicU32,
     /// Exponentially-weighted estimate of delivered bytes/sec, from acks.
     pub delivered: Mutex<RateEst>,
     pub needs_keyframe: AtomicBool,
@@ -51,7 +54,17 @@ pub struct RateEst {
 
 impl Client {
     pub fn send(&self, m: Out) {
-        let _ = self.tx.send(m);
+        if let Some(tx) = &self.bounded_tx {
+            if tx.try_send(m).is_err() {
+                // Real-time viewers skip stale pictures. A new keyframe repairs
+                // the reference chain after a bounded media queue overflows.
+                self.inflight.lock().clear();
+                self.needs_keyframe.store(true, Ordering::Relaxed);
+                self.started.store(false, Ordering::Relaxed);
+            }
+        } else {
+            let _ = self.tx.send(m);
+        }
     }
 
     pub fn on_ack(&self, id: u32) {
@@ -246,6 +259,8 @@ pub struct Hub {
     pub target_kbps: AtomicU32,
     /// Last cursor message, replayed to new clients.
     pub cursor: Mutex<Option<Bytes>>,
+    /// Last observed desktop pointer position (native viewers replay it on join).
+    pub pointer: Mutex<Option<String>>,
     /// Wakes the capture thread (acks, joins, keyframe requests).
     pub waker: Wake,
     pub input: Mutex<Option<std::sync::mpsc::Sender<crate::input::InputEvent>>>,
@@ -273,6 +288,7 @@ impl Hub {
             target_kbps: AtomicU32::new(0),
             stripes: Mutex::new(Vec::new()),
             cursor: Mutex::new(None),
+            pointer: Mutex::new(None),
             waker: Wake::new().expect("wake"),
             input: Mutex::new(None),
             last_clipboard: Mutex::new(None),
@@ -293,13 +309,28 @@ impl Hub {
     }
 
     pub fn add_client(&self, tx: mpsc::UnboundedSender<Out>) -> Arc<Client> {
+        self.add_client_inner(tx, None)
+    }
+
+    pub fn add_bounded_client(&self, tx: mpsc::Sender<Out>) -> Arc<Client> {
+        let (unused, _rx) = mpsc::unbounded_channel();
+        self.add_client_inner(unused, Some(tx))
+    }
+
+    fn add_client_inner(
+        &self,
+        tx: mpsc::UnboundedSender<Out>,
+        bounded_tx: Option<mpsc::Sender<Out>>,
+    ) -> Arc<Client> {
         let c = Arc::new(Client {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             tx,
+            bounded_tx,
             video: AtomicBool::new(false),
             audio: AtomicBool::new(false),
             inflight: Mutex::new(VecDeque::new()),
             min_rtt_ms: AtomicU32::new(0),
+            loss_fraction: AtomicU32::new(0),
             delivered: Mutex::new(RateEst {
                 window_start: Instant::now(),
                 bytes: 0,

@@ -263,7 +263,11 @@ impl RateCtl {
             if !c.started.load(Ordering::Relaxed) {
                 continue;
             }
-            let q = c.delay.lock().queue_ms;
+            let q = c
+                .delay
+                .lock()
+                .queue_ms
+                .max(c.loss_fraction.load(Ordering::Relaxed) as f64 * 4.0);
             let (_, age) = c.backlog();
             let rtt = match c.min_rtt_ms.load(Ordering::Relaxed) {
                 0 => 40,

@@ -41,6 +41,8 @@ pub enum InputEvent {
     ReleaseAll,
     /// Release everything before exit.
     Shutdown,
+    /// Acknowledge release on the native input thread before process shutdown.
+    ShutdownAck(mpsc::Sender<()>),
 }
 
 /// Modifier keysyms -> virtual key.
@@ -282,8 +284,10 @@ impl Injector {
                 GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1),
             )
         };
-        let px = (g.left + x.clamp(0, g.width as i32 - 1) - vx) as i64;
-        let py = (g.top + y.clamp(0, g.height as i32 - 1) - vy) as i64;
+        let stream = super::STREAM_SIZE.lock().unwrap_or((g.width, g.height));
+        let (x, y) = super::stream_to_desktop(g, stream, x, y);
+        let px = (x - vx) as i64;
+        let py = (y - vy) as i64;
         // Windows maps n back to n * size / 65536 pixels; aim at the pixel's centre.
         (
             ((px * 65536 + 32768) / vw as i64) as i32,
@@ -339,8 +343,18 @@ impl Injector {
                 // Desktop pixels -> wheel units (120 per notch); apps that support
                 // high-resolution wheels scroll by fractions of a notch.
                 let k = WHEEL_DELTA as f64 / self.px_per_notch.max(1.0);
-                self.scroll_acc.0 += dx * k;
-                self.scroll_acc.1 -= dy * k;
+                let scale = super::GEOMETRY
+                    .lock()
+                    .map(|g| {
+                        let stream = super::STREAM_SIZE.lock().unwrap_or((g.width, g.height));
+                        (
+                            g.width as f64 / stream.0.max(1) as f64,
+                            g.height as f64 / stream.1.max(1) as f64,
+                        )
+                    })
+                    .unwrap_or((1.0, 1.0));
+                self.scroll_acc.0 += dx * k * scale.0;
+                self.scroll_acc.1 -= dy * k * scale.1;
                 let (x, y) = (self.scroll_acc.0.trunc(), self.scroll_acc.1.trunc());
                 self.scroll_acc.0 -= x;
                 self.scroll_acc.1 -= y;
@@ -360,6 +374,10 @@ impl Injector {
                 }
             }
             InputEvent::ReleaseAll | InputEvent::Shutdown => self.release_all(),
+            InputEvent::ShutdownAck(done) => {
+                self.release_all();
+                let _ = done.send(());
+            }
         }
     }
 
@@ -540,4 +558,45 @@ pub fn spawn(
         })
         .unwrap();
     Ok(tx)
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_ack_releases_a_held_native_modifier() {
+        // Leave a key the person is physically holding alone.
+        if unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) } as u16 & 0x8000 != 0 {
+            return;
+        }
+        let tx = spawn(None, None, 180.0).unwrap();
+        tx.send(InputEvent::Key {
+            keysym: 0xffe4,
+            down: true,
+        })
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        let held = unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) } as u16 & 0x8000 != 0;
+        let (done, finished) = mpsc::channel();
+        tx.send(InputEvent::ShutdownAck(done)).unwrap();
+        drop(tx);
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..20 {
+            if unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) } as u16 & 0x8000 == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            held,
+            "native key injection did not reach this Windows desktop"
+        );
+        assert_eq!(
+            unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) } as u16 & 0x8000,
+            0,
+            "shutdown acknowledged before releasing the held modifier"
+        );
+    }
 }

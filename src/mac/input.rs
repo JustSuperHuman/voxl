@@ -36,6 +36,7 @@ pub enum InputEvent {
     ReleaseAll,
     /// Release everything before exit.
     Shutdown,
+    ShutdownAck(mpsc::Sender<()>),
 }
 
 /// Modifier keysyms: virtual key, flag, and the device bit for its side.
@@ -334,6 +335,10 @@ impl Injector {
                 }
             }
             InputEvent::ReleaseAll | InputEvent::Shutdown => self.release_all(),
+            InputEvent::ShutdownAck(done) => {
+                self.release_all();
+                let _ = done.send(());
+            }
         }
     }
 

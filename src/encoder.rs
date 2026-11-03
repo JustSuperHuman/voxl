@@ -103,7 +103,10 @@ impl Encoder {
             param.vui.i_transfer = 1;
             param.vui.i_colmatrix = 6;
             param.vui.b_fullrange = 0;
-            let profile = c"high";
+            // Constrained baseline decodes on native mobile WebRTC and WebCodecs.
+            // No B-frames or CABAC: a lost frame never holds later frames in a
+            // decoder's reorder buffer.
+            let profile = c"baseline";
             ffi::x264_param_apply_profile(&mut param, profile.as_ptr());
 
             let h = ffi::x264_encoder_open(&mut param);

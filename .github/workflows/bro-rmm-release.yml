@@ -1,0 +1,71 @@
+name: Bro RMM Windows preview
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New package version (existing releases are never replaced)
+        required: true
+        default: '0.1.0'
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2025
+    env:
+      PACKAGE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Native dependencies
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP/vcpkg"
+          git -C "$env:RUNNER_TEMP/vcpkg" fetch --depth 1 origin afa249f12f52ed8a3b919f195495ba8b330288d1
+          git -C "$env:RUNNER_TEMP/vcpkg" checkout FETCH_HEAD
+          & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:RUNNER_TEMP/vcpkg" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+      - name: Build and test
+        shell: pwsh
+        run: |
+          $env:VCPKGRS_TRIPLET = 'x64-windows-static-md'
+          & "$env:VCPKG_ROOT/vcpkg.exe" install x264 libyuv opus --triplet $env:VCPKGRS_TRIPLET
+          $nativeClang="$env:VCPKG_ROOT/downloads/tools/clang/clang-21.1.8/bin"
+          if (Test-Path "$nativeClang/libclang.dll") { $env:LIBCLANG_PATH=$nativeClang }
+          npm install --no-save esbuild@0.28.2
+          $env:ESBUILD = "$pwd/node_modules/.bin/esbuild.cmd"
+          cargo test --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+          cargo build --locked --release --bin voxl
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+          ./packaging/package.ps1 -Version $env:PACKAGE_VERSION
+          ./packaging/source-bundle.ps1 -Version $env:PACKAGE_VERSION
+      - name: Publish immutable preview
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "bro-rmm-v$env:PACKAGE_VERSION"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'This release already exists; choose a new version.' }
+          gh release create $tag dist/bro-rmm-windows-x86_64.zip dist/bro-rmm-source.zip dist/SHA256SUMS --prerelease --target $env:GITHUB_SHA --title "Bro RMM ${{ inputs.version }} preview" --notes-file packaging/RELEASE.md
+          if ($LASTEXITCODE -ne 0) { throw 'Version release failed' }
+      - name: Sign and publish the update channel
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRO_RMM_SIGNING_KEY: ${{ secrets.BRO_RMM_SIGNING_KEY }}
+        run: |
+          if (-not $env:BRO_RMM_SIGNING_KEY) { throw 'BRO_RMM_SIGNING_KEY secret is required.' }
+          node packaging/sign-catalog.mjs $env:PACKAGE_VERSION dist $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Catalog signing failed.' }
+          gh release view bro-rmm-channel-v1 *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create bro-rmm-channel-v1 --prerelease --target $env:GITHUB_SHA --title 'Bro RMM signed update channel' --notes 'Signed package catalog. Versioned package releases contain source and notices.'
+            if ($LASTEXITCODE -ne 0) { throw 'Channel release creation failed.' }
+          }
+          gh release upload bro-rmm-channel-v1 dist/catalog.json --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Channel publication failed.' }
