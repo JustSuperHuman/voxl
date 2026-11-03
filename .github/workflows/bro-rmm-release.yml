@@ -49,9 +49,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "bro-rmm-v$env:PACKAGE_VERSION"
-          gh release view $tag *> $null
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) { throw 'This release already exists; choose a new version.' }
-          gh release create $tag dist/bro-rmm-windows-x86_64.zip dist/bro-rmm-source.zip dist/SHA256SUMS --prerelease --target $env:GITHUB_SHA --title "Bro RMM ${{ inputs.version }} preview" --notes-file packaging/RELEASE.md
+          gh release create $tag dist/bro-rmm-windows-x86_64.zip dist/bro-rmm-source.zip dist/SHA256SUMS --repo $env:GITHUB_REPOSITORY --prerelease --target $env:GITHUB_SHA --title "Bro RMM $env:PACKAGE_VERSION preview" --notes-file packaging/RELEASE.md
           if ($LASTEXITCODE -ne 0) { throw 'Version release failed' }
       - name: Sign and publish the update channel
         shell: pwsh
@@ -62,10 +62,10 @@ jobs:
           if (-not $env:BRO_RMM_SIGNING_KEY) { throw 'BRO_RMM_SIGNING_KEY secret is required.' }
           node packaging/sign-catalog.mjs $env:PACKAGE_VERSION dist $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Catalog signing failed.' }
-          gh release view bro-rmm-channel-v1 *> $null
+          gh release view bro-rmm-channel-v1 --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create bro-rmm-channel-v1 --prerelease --target $env:GITHUB_SHA --title 'Bro RMM signed update channel' --notes 'Signed package catalog. Versioned package releases contain source and notices.'
+            gh release create bro-rmm-channel-v1 --repo $env:GITHUB_REPOSITORY --prerelease --target $env:GITHUB_SHA --title 'Bro RMM signed update channel' --notes 'Signed package catalog. Versioned package releases contain source and notices.'
             if ($LASTEXITCODE -ne 0) { throw 'Channel release creation failed.' }
           }
-          gh release upload bro-rmm-channel-v1 dist/catalog.json --clobber
+          gh release upload bro-rmm-channel-v1 dist/catalog.json --clobber --repo $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'Channel publication failed.' }
